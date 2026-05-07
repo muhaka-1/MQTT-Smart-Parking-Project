@@ -24,6 +24,7 @@
       "id": "lcd2",
       "top": 313.6,
       "left": 850.4,
+<<<<<<< HEAD
       "attrs": { "pins": "i2c", "i2cAddress": "0x3f" }
     },
     {
@@ -36,6 +37,11 @@
    
   ],
   
+=======
+      "attrs": { "pins": "i2c","i2cAddress": "0x3f" }
+    }
+  ],
+>>>>>>> 4c1c309901fafda5a94426de8cfa24404ca17e73
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
     [ "esp:RX", "$serialMonitor:TX", "", [] ],
@@ -82,9 +88,13 @@
     [ "lcd2:SCL", "esp:22", "green", [ "h-422.4", "v0.3" ] ],
     [ "lcd2:SDA", "esp:21", "yellow", [ "h-432", "v-316.6", "h-38.4" ] ],
     [ "lcd2:VCC", "esp:3V3", "red", [ "h-748.8", "v-355.1" ] ],
+<<<<<<< HEAD
     [ "lcd2:GND", "esp:GND.1", "black", [ "h-672", "v-220.8" ] ],
     [ "bz1:1", "esp:GND.1", "black", [ "v0", "h-259.2", "v-518.4" ] ],
     [ "bz1:2", "esp:3V3", "red", [ "v9.6", "h-317.2", "v-652.8" ] ]
+=======
+    [ "lcd2:GND", "esp:GND.1", "black", [ "h-672", "v-220.8" ] ]
+>>>>>>> 4c1c309901fafda5a94426de8cfa24404ca17e73
   ],
   "dependencies": {}
 }
