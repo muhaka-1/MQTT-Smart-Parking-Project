@@ -1,43 +1,33 @@
-<<<<<<< HEAD
-#include <Wire.h>
-=======
 #include <Arduino.h>
-#include <WiFi.h>
->>>>>>> 4c1c309901fafda5a94426de8cfa24404ca17e73
+#include <Wire.h>
 #include <SPI.h>
 #include <MFRC522.h>
 #include <ESP32Servo.h>
 #include <LiquidCrystal_I2C.h>
-<<<<<<< HEAD
 #include <WiFi.h>
 #include <LittleFS.h>
-#include <PubSubClient.h> 
+#include <Redis.h>
 #include <map> 
 
 // =======================================================
-// 1. SETTINGS & VARIABLES
+// 1. INSTÄLLNINGAR & VARIABLER
 // =======================================================
-const char* ssid = "Tele2Internet-B5596";
+const char* ssid = "Tele2Internet_B5596";
 const char* password = "B648nLhA5a5";
-const char* mqtt_broker = "192.168.8.131"; 
-const int mqtt_port = 1883;
+const char* redis_host = "192.168.8.131";
+const int redis_port = 6379;
 const char* queueFile = "/queue.txt";
 
-// MQTT Topics
-const char* topic_logs = "parking/logs";
-const char* topic_access_request = "parking/access/request";
+int freeSpots = 50; 
+WiFiClient redisClient;
 
-int freeSpots = 100; 
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-
-std::map<String, unsigned long> parkingTimes;
+std::map<String, unsigned long> parkeringstider;
 
 // =======================================================
-// 2. PIN DEFINITIONS
+// 2. PIN-DEFINITIONER
 // =======================================================
-#define BUZZER_PIN 15 
-#define BUZZER_CHANNEL 7  
+#define BUZZER_PIN 16 // <--- UPPDATERAD TILL PIN 15!
+#define BUZZER_CHANNEL 17  // added channel this to not mix signal with servo
 #define RST_PIN 27
 #define SS_IN_PIN 5
 #define SS_OUT_PIN 4
@@ -52,11 +42,11 @@ std::map<String, unsigned long> parkingTimes;
 
 #define TRIG_OUT_BEFORE 25
 #define ECHO_OUT_BEFORE 2
-#define TRIG_OUT_AFTER 16 
+#define TRIG_OUT_AFTER 26   
 #define ECHO_OUT_AFTER 15
 
 // =======================================================
-// 3. OBJECTS & STATES
+// 3. OBJEKT & TILLSTÅND
 // =======================================================
 LiquidCrystal_I2C lcdIn(0x27, 16, 2); 
 LiquidCrystal_I2C lcdOut(0x26, 16, 2); 
@@ -78,7 +68,7 @@ bool carAtOutBefore = false;
 unsigned long lastSensorCheck = 0;
 
 // =======================================================
-// 4. HARDWARE HELPER FUNCTIONS
+// 4. HJÄLPFUNKTIONER FÖR HÅRDVARA
 // =======================================================
 
 long getDistance(int trigPin, int echoPin) {
@@ -91,17 +81,19 @@ long getDistance(int trigPin, int echoPin) {
   return duration * 0.034 / 2;
 }
 
+// Simple tone implementation for ESP32   , 
 void initBuzzer() {
-  ledcSetup(BUZZER_CHANNEL, 2000, 8);
+  // ONE TIME SETUP - never change these again!
+  ledcSetup(BUZZER_CHANNEL, 2000, 8);  // Setup once
   ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
   ledcWrite(BUZZER_CHANNEL, 0);
 }
 
 void beep(int duration, int times = 1) {
   for (int i = 0; i < times; i++) {
-    ledcWriteTone(BUZZER_CHANNEL, 2000);
+    ledcWriteTone(BUZZER_CHANNEL, 2000);  // Start tone
     delay(duration);
-    ledcWrite(BUZZER_CHANNEL, 0);
+    ledcWrite(BUZZER_CHANNEL, 0);  // Stop tone
     if (times > 1 && i < times-1) delay(100);
   }
 }
@@ -113,11 +105,11 @@ void initLCD() {
 }
 
 void updateDisplays() {
-  lcdIn.setCursor(0, 0);  lcdIn.print("Spots: " + String(freeSpots) + "    ");
-  lcdIn.setCursor(0, 1);  lcdIn.print("Scan card...    ");
+  lcdIn.setCursor(0, 0);  lcdIn.print("Platser: " + String(freeSpots) + "    ");
+  lcdIn.setCursor(0, 1);  lcdIn.print("Scanna kort...  ");
   
-  lcdOut.setCursor(0, 0); lcdOut.print("Spots: " + String(freeSpots) + "    ");
-  lcdOut.setCursor(0, 1); lcdOut.print("Scan card...    ");
+  lcdOut.setCursor(0, 0); lcdOut.print("Platser: " + String(freeSpots) + "    ");
+  lcdOut.setCursor(0, 1); lcdOut.print("Scanna kort...  ");
 }
 
 String getUID(MFRC522 &rfid) {
@@ -129,26 +121,12 @@ String getUID(MFRC522 &rfid) {
 }
 
 // =======================================================
-// 5. NETWORK & MQTT LOGIC
+// 5. NÄTVERK OCH DATABAS (Minimalistisk för felsökning)
 // =======================================================
 
-void reconnectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (mqttClient.connect("ESP32ParkingClient")) {
-      Serial.println(" connected");
-    } else {
-      Serial.print(" failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" retrying in 5 seconds");
-      delay(5000);
-    }
-  }
-}
-
 void connectWiFi() {
-  lcdIn.clear(); lcdIn.print("WiFi: Connecting");
-  Serial.print("Connecting to Wi-Fi...");
+  lcdIn.clear(); lcdIn.print("WiFi: Ansluter..");
+  Serial.print("Ansluter till Wi-Fi...");
   WiFi.begin(ssid, password);
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 10) {
@@ -158,20 +136,21 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println(" OK!"); lcdIn.print("WiFi: OK!");
     lcdOut.clear(); lcdOut.print("IP: " + WiFi.localIP().toString());
-    mqttClient.setServer(mqtt_broker, mqtt_port);
   } else {
     Serial.println(" OFFLINE!"); lcdIn.print("WiFi: OFFLINE");
-    lcdOut.clear(); lcdOut.print("Local Mode");
+    lcdOut.clear(); lcdOut.print("Lokal Lagring");
   }
   delay(2000); 
 }
 
 bool checkAccess(String uid) {
   if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) reconnectMQTT();
-    String msg = "Access Request UID: " + uid;
-    mqttClient.publish(topic_access_request, msg.c_str());
-    return true; // Logic defaults to true unless server sends command to block
+    if (redisClient.connect(redis_host, redis_port)) {
+      Redis redis(redisClient); 
+      String access = redis.get(("access:" + uid).c_str());
+      redisClient.stop(); 
+      return (access == "1"); 
+    }
   }
   return true; 
 }
@@ -179,25 +158,29 @@ bool checkAccess(String uid) {
 void logPassage(String uid, String direction) {
   String logData = uid + "," + direction + "," + String(millis());
   if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) reconnectMQTT();
-    mqttClient.publish(topic_logs, logData.c_str());
-  } else {
-    File file = LittleFS.open(queueFile, FILE_APPEND);
-    if (file) { file.println(logData); file.close(); }
+    if (redisClient.connect(redis_host, redis_port)) {
+      Redis redis(redisClient);
+      redis.rpush("parking_logs", logData.c_str());
+      redisClient.stop();
+      return; 
+    }
   }
+  File file = LittleFS.open(queueFile, FILE_APPEND);
+  if (file) { file.println(logData); file.close(); }
 }
 
 void syncOfflineData() {
   if (WiFi.status() == WL_CONNECTED && LittleFS.exists(queueFile)) {
-    if (!mqttClient.connected()) reconnectMQTT();
-    File file = LittleFS.open(queueFile, FILE_READ);
-    while (file.available()) {
-      String logData = file.readStringUntil('\n');
-      logData.trim();
-      if (logData.length() > 0) mqttClient.publish(topic_logs, logData.c_str());
+    if (redisClient.connect(redis_host, redis_port)) {
+      Redis redis(redisClient);
+      File file = LittleFS.open(queueFile, FILE_READ);
+      while (file.available()) {
+        String logData = file.readStringUntil('\n');
+        logData.trim();
+        if (logData.length() > 0) redis.rpush("parking_logs", logData.c_str());
+      }
+      file.close(); redisClient.stop(); LittleFS.remove(queueFile); 
     }
-    file.close(); 
-    LittleFS.remove(queueFile); 
   }
 }
 
@@ -208,9 +191,9 @@ void setup() {
   Serial.begin(115200);
   delay(1000); 
   
-  initBuzzer(); 
+  initBuzzer(); // Startar tyst på Pin 15
   initLCD();
-  lcdIn.clear(); lcdIn.print("Loading System..");
+  lcdIn.clear(); lcdIn.print("Laddar System...");
   delay(1000);
 
   Serial.println("\n=== SYSTEM BOOT ===");
@@ -237,30 +220,29 @@ void setup() {
   syncOfflineData();
 
   updateDisplays();
-  beep(100, 3); 
-  Serial.println("\n=== SYSTEM READY ===");
+  beep(100, 3); // Testar nya Pin 15
+  Serial.println("\n=== SYSTEM REDO OCH KÖRS! ===");
 }
 
 // =======================================================
-// 7. MAIN LOOP 
+// 7. HUVUDLOOP 
 // =======================================================
 void loop() {
-  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-    reconnectMQTT();
-  }
-  mqttClient.loop();
-
-  // --- CAR DETECTION (Sensors) ---
+  
+  // --- KOLLA BILAR (Sensorer) ---
   if (millis() - lastSensorCheck > 1000) { 
+    // Jeder Sensor braucht einen eigenen, eindeutigen Variablennamen
     long distInBefore = getDistance(TRIG_IN_BEFORE, ECHO_IN_BEFORE);
     long distInAfter  = getDistance(TRIG_IN_AFTER, ECHO_IN_AFTER);
     long distOutBefore = getDistance(TRIG_OUT_BEFORE, ECHO_OUT_BEFORE);
     long distOutAfter  = getDistance(TRIG_OUT_AFTER, ECHO_OUT_AFTER);
 
-    Serial.print("IN - Before: "); Serial.print(distInBefore); Serial.print(" cm, After: "); Serial.print(distInAfter);
-    Serial.print(" | OUT - Before: "); Serial.print(distOutBefore); Serial.print(" cm, After: "); Serial.print(distOutAfter);
+    // Ausgabe aller 4 Werte in einer Zeile zur besseren Übersicht
+    Serial.print("IN - Vorher: "); Serial.print(distInBefore); Serial.print(" cm, Nachher: "); Serial.print(distInAfter);
+    Serial.print(" | UT - Vorher: "); Serial.print(distOutBefore); Serial.print(" cm, Nachher: "); Serial.print(distOutAfter);
     Serial.println(" cm");
 
+    // ÄNDRAT TILL 5 cm FÖR TEST
     if (distInBefore <= 5 && !carAtInBefore) { carAtInBefore = true; beep(100); } 
     else if (distInBefore > 5) { carAtInBefore = false; }
 
@@ -270,45 +252,51 @@ void loop() {
     lastSensorCheck = millis();
   }
 
-  // --- ENTRANCE HANDLER ---
-  if (!gateInOpen && rfidIn.PICC_IsNewCardPresent() && rfidIn.PICC_ReadCardSerial()) {
-    beep(50);
-    String uid = getUID(rfidIn);
-    
-    if (freeSpots <= 0) {
-      lcdIn.clear(); 
-      lcdIn.print("PARKING FULL!");
-      lcdIn.setCursor(0, 1);
-      lcdIn.print("No spots left");
-      beep(500, 3);
-    }
-    else if (checkAccess(uid)) {
-      freeSpots--;
-      logPassage(uid, "IN");
-      parkingTimes[uid] = millis();
-      lcdIn.clear(); 
-      lcdIn.print("Welcome!");
-      lcdIn.setCursor(0, 1);
-      lcdIn.print("Spots left: " + String(freeSpots));
-      beep(100, 2);
-      servoIn.write(90); 
-      gateInOpen = true;
-      gateInTimer = millis();
-      updateDisplays();
-    } 
-    else {
-      lcdIn.clear(); 
-      lcdIn.print("Access Denied!");
-      lcdIn.setCursor(0, 1);
-      lcdIn.print("Invalid Card");
-      beep(500);
-    }
-    rfidIn.PICC_HaltA();
+// --- HANTERA INGÅNG (Kortläsare) ---
+if (!gateInOpen && rfidIn.PICC_IsNewCardPresent() && rfidIn.PICC_ReadCardSerial()) {
+  beep(50);
+  String uid = getUID(rfidIn);
+  
+  // DIRECT CHECK - No function needed
+  if (freeSpots <= 0) {
+    lcdIn.clear(); 
+    lcdIn.print("PARKERING FULL!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Ingen plats");
+    beep(500, 3);
+    Serial.println("Access DENIED - Parking full!");
   }
+  else if (checkAccess(uid)) {
+    freeSpots--;
+    logPassage(uid, "IN");
+    parkeringstider[uid] = millis();
+    lcdIn.clear(); 
+    lcdIn.print("Valkommen!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Platser kvar: " + String(freeSpots));
+    beep(100, 2);
+    servoIn.write(90); 
+    gateInOpen = true;
+    gateInTimer = millis();
+    updateDisplays();
+    Serial.printf("Access GRANTED - Free spots: %d\n", freeSpots);
+  } 
+  else {
+    lcdIn.clear(); 
+    lcdIn.print("Nekad Access!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Ogiltigt kort");
+    beep(500);
+    Serial.println("Access DENIED - Invalid card");
+  }
+  
+  rfidIn.PICC_HaltA();
+}
 
-  // --- ENTRANCE GATE TIMEOUT ---
+  // --- HANTERA INGÅNGENS BOM ---
   if (gateInOpen && (millis() - gateInTimer > 10000)) { 
-    if (getDistance(TRIG_IN_AFTER, ECHO_IN_AFTER) > 5) {
+    long carPassedDist = getDistance(TRIG_IN_AFTER, ECHO_IN_AFTER);
+    if (carPassedDist > 5) { // ÄNDRAT TILL 5 cm FÖR TEST
       servoIn.write(0); 
       gateInOpen = false;
       updateDisplays();
@@ -317,7 +305,7 @@ void loop() {
     }
   }
 
-  // --- EXIT HANDLER ---
+  // --- HANTERA UTGÅNG (Kortläsare) ---
   if (!gateOutOpen && rfidOut.PICC_IsNewCardPresent() && rfidOut.PICC_ReadCardSerial()) {
     beep(50);
     String uid = getUID(rfidOut);
@@ -325,33 +313,34 @@ void loop() {
       freeSpots++;
       logPassage(uid, "OUT");
 
-      String timeMsg = "Time unknown";
-      if (parkingTimes.count(uid)) { 
-        unsigned long parkedTimeMs = millis() - parkingTimes[uid];
+      String timeMsg = "Tid okand";
+      if (parkeringstider.count(uid)) { 
+        unsigned long parkedTimeMs = millis() - parkeringstider[uid];
         unsigned long totalSecs = parkedTimeMs / 1000;
         unsigned long mins = totalSecs / 60;
         unsigned long secs = totalSecs % 60;
-        if (mins > 0) { timeMsg = "Time: " + String(mins) + "m " + String(secs) + "s"; } 
-        else { timeMsg = "Time: " + String(secs) + " seconds"; }
-        parkingTimes.erase(uid); 
+        if (mins > 0) { timeMsg = "Tid: " + String(mins) + "m " + String(secs) + "s"; } 
+        else { timeMsg = "Tid: " + String(secs) + " sekunder"; }
+        parkeringstider.erase(uid); 
       }
       lcdOut.clear(); 
-      lcdOut.setCursor(0, 0); lcdOut.print("Thanks for visit");
+      lcdOut.setCursor(0, 0); lcdOut.print ("Tack for besoket");
       lcdOut.setCursor(0, 1); lcdOut.print(timeMsg);
       beep(100, 2);
       servoOut.write(90); 
       gateOutOpen = true;
       gateOutTimer = millis();
     } else {
-      lcdOut.clear(); lcdOut.print("Access Denied!");
+      lcdOut.clear(); lcdOut.print("Nekad Access!");
       beep(500); 
     }
     rfidOut.PICC_HaltA();
   }
 
-  // --- EXIT GATE TIMEOUT ---
+  // --- HANTERA UTGÅNGENS BOM ---
   if (gateOutOpen && (millis() - gateOutTimer > 10000)) {
-    if (getDistance(TRIG_OUT_AFTER, ECHO_OUT_AFTER) > 5) {
+    long carPassedDist = getDistance(TRIG_OUT_AFTER, ECHO_OUT_AFTER);
+    if (carPassedDist > 5) { // ÄNDRAT TILL 5 cm FÖR TEST
       servoOut.write(0); 
       gateOutOpen = false;
       updateDisplays();
@@ -359,263 +348,4 @@ void loop() {
       gateOutTimer = millis(); 
     }
   }
-=======
-#include <PubSubClient.h> 
-#include <FS.h>
-#include <LittleFS.h>
-
-// --- CONFIGURATION ---
-const char* ssid = "Wokwi-GUEST"; 
-const char* password = "";
-const char* mqtt_server = "192.168.1.XX"; // Replace with your Raspberry Pi IP
-const int mqtt_port = 1883;
-
-// --- OFFLINE SETTINGS ---
-// "742B4912" is the default tag UID for Wokwi simulation testing
-String localWhitelist[] = {"742B4912", "A1B2C3D4", "B2C3D4E5"}; 
-const int whitelistSize = 3;
-const char* LOG_FILE = "/offline_logs.txt";
-
-// --- PIN MAPPING ---
-#define BUZZER_PIN 2
-#define RST_PIN 27      
-#define SS_IN_PIN 5     
-#define SS_OUT_PIN 4    
-#define SERVO_IN_PIN 13
-#define SERVO_OUT_PIN 14
-#define TRIG_IN_AFTER 33
-#define ECHO_IN_AFTER 35
-#define TRIG_OUT_AFTER 26
-#define ECHO_OUT_AFTER 15  
-
-// --- OBJECTS ---
-MFRC522 rfidIn(SS_IN_PIN, RST_PIN);
-MFRC522 rfidOut(SS_OUT_PIN, RST_PIN);
-Servo gateIn;
-Servo gateOut;
-LiquidCrystal_I2C lcdIn(0x27, 16, 2);  
-LiquidCrystal_I2C lcdOut(0x3F, 16, 2); 
-
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-
-int occupiedSpaces = 0;
-const int TOTAL_SPACES = 100;
-bool accessGranted = false;
-
-// --- DISPLAY & SOUND ---
-void updateDisplays() {
-    lcdIn.clear();
-    lcdIn.setCursor(0, 0);
-    lcdIn.print(WiFi.status() == WL_CONNECTED ? "Mode: Online" : "Mode: Offline");
-    lcdIn.setCursor(0, 1);
-    lcdIn.print("Spaces: ");
-    lcdIn.print(TOTAL_SPACES - occupiedSpaces);
-
-    lcdOut.clear();
-    lcdOut.setCursor(0, 0);
-    lcdOut.print("Smart Parking");
-    lcdOut.setCursor(0, 1);
-    lcdOut.print("Safe Travels!");
-}
-
-void triggerBuzzer(int ms) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(ms);
-    digitalWrite(BUZZER_PIN, LOW);
-}
-
-// --- SENSOR LOGIC ---
-long getDistance(int trig, int echo) {
-    digitalWrite(trig, LOW); delayMicroseconds(2);
-    digitalWrite(trig, HIGH); delayMicroseconds(10);
-    digitalWrite(trig, LOW);
-    long duration = pulseIn(echo, HIGH, 30000); 
-    return (duration == 0) ? 999 : duration * 0.034 / 2;
-}
-
-// --- STORAGE & SYNC ---
-void logOfflineAccess(String uid, String type) {
-    File file = LittleFS.open(LOG_FILE, FILE_APPEND);
-    if (!file) {
-        Serial.println("Failed to open log file");
-        return;
-    }
-    file.println(uid + "," + type);
-    file.close();
-    Serial.println("Stored offline: " + uid + " (" + type + ")");
-}
-
-void syncOfflineData() {
-    if (!LittleFS.exists(LOG_FILE)) return;
-
-    Serial.println("Syncing offline data to MQTT...");
-    File file = LittleFS.open(LOG_FILE, FILE_READ);
-    if (!file) return;
-
-    while (file.available()) {
-        String line = file.readStringUntil('\n');
-        line.trim();
-        if (line.length() > 0) {
-            mqttClient.publish("parking/sync/offline", line.c_str());
-            delay(50); // Prevent flooding
-        }
-    }
-    file.close();
-    LittleFS.remove(LOG_FILE);
-    Serial.println("Sync complete. Logs cleared.");
-}
-
-bool checkLocalWhitelist(String uid) {
-    for (int i = 0; i < whitelistSize; i++) {
-        if (uid == localWhitelist[i]) return true;
-    }
-    return false;
-}
-
-// --- MQTT CALLBACK ---
-void callback(char* topic, byte* payload, unsigned int length) {
-    String message = "";
-    for (int i = 0; i < length; i++) message += (char)payload[i];
-    if (String(topic) == "parking/access/res" && message == "GRANTED") {
-        accessGranted = true;
-    }
-}
-
-// --- GATE PROCESSOR ---
-void processGate(MFRC522 &rfid, LiquidCrystal_I2C &lcd, Servo &servo, int trigAfter, int echoAfter, String type) {
-    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
-
-    String uid = "";
-    for (byte i = 0; i < rfid.uid.size; i++) {
-        uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-        uid += String(rfid.uid.uidByte[i], HEX);
-    }
-    uid.toUpperCase();
-
-    lcd.clear();
-    lcd.print("ID: " + uid);
-    lcd.setCursor(0, 1);
-    lcd.print("Verifying...");
-    
-    bool allowed = false;
-    accessGranted = false;
-
-    // 1. Attempt Online Check
-    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
-        mqttClient.publish("parking/access/req", uid.c_str());
-        unsigned long startWait = millis();
-        while (millis() - startWait < 1500) { // 1.5s timeout
-            mqttClient.loop();
-            if (accessGranted) {
-                allowed = true;
-                break;
-            }
-        }
-    }
-
-    // 2. Fallback to Offline Check
-    if (!allowed) {
-        if (checkLocalWhitelist(uid)) {
-            allowed = true;
-            logOfflineAccess(uid, type); // Save for later sync
-            Serial.println("Allowed via Whitelist (Offline)");
-        }
-    }
-
-    // 3. Action
-    if (allowed) {
-        triggerBuzzer(100);
-        lcd.clear();
-        lcd.print(type == "IN" ? "Access Granted" : "Goodbye!");
-        
-        servo.write(90); 
-        Serial.println("Gate Open. Waiting for vehicle...");
-        
-        // Wait for car to trigger the ultrasonic sensor
-        while (getDistance(trigAfter, echoAfter) > 15) { 
-            delay(100); 
-            // Safety: could add a timeout here
-        }
-        
-        delay(2000); // Wait for vehicle to clear
-        servo.write(0); 
-        Serial.println("Gate Closed.");
-
-        if (type == "IN") occupiedSpaces++;
-        else if (occupiedSpaces > 0) occupiedSpaces--;
-        
-        updateDisplays();
-    } else {
-        triggerBuzzer(500);
-        lcd.clear();
-        lcd.print("Access Denied");
-        delay(2000);
-        updateDisplays();
-    }
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-}
-
-// --- SETUP & LOOP ---
-void setup() {
-    Serial.begin(115200);
-    SPI.begin();
-
-    // Initialize FS
-    if (!LittleFS.begin(true)) {
-        Serial.println("LittleFS Mount Failed");
-    }
-    
-    pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(TRIG_IN_AFTER, OUTPUT); pinMode(ECHO_IN_AFTER, INPUT);
-    pinMode(TRIG_OUT_AFTER, OUTPUT); pinMode(ECHO_OUT_AFTER, INPUT);
-
-    rfidIn.PCD_Init();
-    rfidOut.PCD_Init();
-    
-    gateIn.attach(SERVO_IN_PIN);
-    gateOut.attach(SERVO_OUT_PIN);
-    gateIn.write(0);
-    gateOut.write(0);
-
-    lcdIn.init(); lcdIn.backlight();
-    lcdOut.init(); lcdOut.backlight();
-
-    WiFi.begin(ssid, password);
-    mqttClient.setServer(mqtt_server, mqtt_port);
-    mqttClient.setCallback(callback);
-    
-    updateDisplays();
-}
-
-void loop() {
-    static unsigned long lastReconnectAttempt = 0;
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!mqttClient.connected()) {
-            unsigned long now = millis();
-            if (now - lastReconnectAttempt > 5000) {
-                lastReconnectAttempt = now;
-                if (mqttClient.connect("ESP32_Parking_System")) {
-                    Serial.println("MQTT Connected");
-                    mqttClient.subscribe("parking/access/res");
-                    syncOfflineData(); // Push saved logs to Pi
-                    updateDisplays();
-                }
-            }
-        }
-    }
-
-    mqttClient.loop();
-    processGate(rfidIn, lcdIn, gateIn, TRIG_IN_AFTER, ECHO_IN_AFTER, "IN");
-    processGate(rfidOut, lcdOut, gateOut, TRIG_OUT_AFTER, ECHO_OUT_AFTER, "OUT");
-    
-    // Refresh display status occasionally if WiFi state changes
-    static long lastWifiCheck = 0;
-    if (millis() - lastWifiCheck > 10000) {
-        lastWifiCheck = millis();
-        updateDisplays();
-    }
->>>>>>> 4c1c309901fafda5a94426de8cfa24404ca17e73
 }
