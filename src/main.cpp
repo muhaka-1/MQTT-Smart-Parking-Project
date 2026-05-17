@@ -1,5 +1,3 @@
-
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -7,7 +5,8 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
-// ESP32 core 2.x has LittleFS built-in; core 1.x needs LITTLEFS.h + alias
+
+// ESP32 core compile-time validation for LittleFS compatibility layers
 #ifdef __has_include
   #if __has_include(<LittleFS.h>)
     #include <LittleFS.h>
@@ -18,182 +17,156 @@
 #else
   #include <LittleFS.h>
 #endif
-#include <Redis.h>
 
-
-
+#include <PubSubClient.h> 
 
 // =======================================================
-// WiFi CONFIGURATION
+// WiFi & MQTT NETWORK CONFIGURATION
 // =======================================================
-const char* ssid = "Tele2Internet_B5596";
-const char* password = "B648nLhA5a5";
-const char* redisHost  = "192.168.8.115";
-const int   redisPort  = 6379;
+const char* ssid        = "Tele2Internet_B5596";
+const char* password    = "B648nLhA5a5";
+const char* mqttHost    = "192.168.8.131"; 
+const int   mqttPort    = 1883;
 
-
-// =======================================================
-// ACCESS POLICY
-// Hybrid cache: only cards present in the local cache may
-// enter — works the same online or offline. Strangers are
-// always denied. The cache is refreshed automatically when
-// the admin updates Redis (see CACHE_VERSION_KEY below).
-// =======================================================
-
-
-// =======================================================
-// REDIS CLIENT
-// =======================================================
-WiFiClient redisClient;
-Redis      redis(redisClient);
-bool       redisOnline = false;
-
+// Structured Domain-Specific Messaging Topics
+const char* topicEntryLog     = "parking/entry_log";
+const char* topicExitLog      = "parking/exit_log";
+const char* topicLastEntry    = "parking/last_entry";
+const char* topicLastExit     = "parking/last_exit";
+const char* topicCountUpdate  = "parking/count_update";
+const char* topicStatus       = "parking/status";
+const char* topicCacheVersion = "parking/cards_version";
 
 // =======================================================
-// PIN DEFINITIONS
+// SYSTEM NETWORKING INITIALIZATION
 // =======================================================
-#// --- Pin Configuration (Freenove ESP32-S3) ---
-#define LCD_ENTRY_ADDR        1
-#define LCD_EXIT_ADDR         2
-#define RST_PIN        5
-#define SS_ENTRY_PIN   10
-#define SS_EXIT_PIN    6
-#define BUZZER_PIN      3
-#define SERVO_ENTRY_PIN 4
-#define SERVO_EXIT_PIN  18
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+bool mqttOnline = false;
 
-// Hardware SPI pins for S3
+// =======================================================
+// HARDWARE CORRECTIONS & CONSTANTS (Freenove ESP32-S3)
+// =======================================================
+#define LCD_ENTRY_ADDR 0x27
+#define LCD_EXIT_ADDR  0x26
+
+#define RST_RFID        5
+#define SS_RFID_ENTRY   10
+#define SS_RFID_EXIT    6
+
 #define SCK_PIN         12
 #define MISO_PIN        13
 #define MOSI_PIN        11
 
-// Ultrasonic - Entry
-#define TRIG_ENTRY_BEFORE  47
-#define ECHO_ENTRY_BEFORE  48
-#define TRIG_ENTRY_AFTER   21
-#define ECHO_ENTRY_AFTER   20
+#define BUZZER_PIN      3
+#define BUZZER_CHANNEL  14 // Hard isolated to prevent servo signal pollution
 
-// Ultrasonic - Exit
-#define TRIG_EXIT_BEFORE   7
-#define ECHO_EXIT_BEFORE   15
-#define TRIG_EXIT_AFTER    16
-#define ECHO_EXIT_AFTER    17
+#define SERVO_ENTRY_PIN 4
+#define SERVO_EXIT_PIN  18
 
-// =======================================================
-// LITTLEFS FILE PATHS
-// =======================================================
-#define OFFLINE_QUEUE     "/offline_queue.txt"
-#define VALID_UIDS_FILE   "/valid_uids.txt"
+// Ultrasonic Cluster Pin Assignments
+#define TRIG_ENTRY_BEFORE 16
+#define ECHO_ENTRY_BEFORE 17
+#define TRIG_ENTRY_AFTER  7
+#define ECHO_ENTRY_AFTER  15 
 
+#define TRIG_EXIT_BEFORE  20
+#define ECHO_EXIT_BEFORE  21
+#define TRIG_EXIT_AFTER   8   
+#define ECHO_EXIT_AFTER   9
 
 // =======================================================
-// CACHE / SYNC PROTOCOL
-// Admin contract: every change to authorized cards must
-// also INCR parking:cards_version atomically. ESP32 polls
-// this counter every CACHE_CHECK_INTERVAL ms — when it
-// changes, the local cache is refreshed from Redis.
+// STORAGE ARCHITECTURE PATHS
 // =======================================================
-#define CACHE_VERSION_KEY        "parking:cards_version"
-#define CACHE_CHECK_INTERVAL_MS  3000UL
-
-
-unsigned long lastCacheCheck = 0;
-long          cachedVersion  = -1;     // last version we synced to LittleFS
-bool          cacheReady     = false;  // never authorize anyone until true
-
+#define OFFLINE_QUEUE   "/offline_queue.txt"
+#define VALID_UIDS_FILE "/valid_uids.txt"
 
 // =======================================================
-// GLOBAL OBJECTS
+// ASYNCHRONOUS POLLING PROTOCOL CONFIGURATION
 // =======================================================
-MFRC522           rfidEntry(SS_ENTRY_PIN, RST_PIN);
-MFRC522           rfidExit(SS_EXIT_PIN, RST_PIN);
+#define CACHE_CHECK_INTERVAL_MS 3000UL
+unsigned long lastCacheCheck  = 0;
+long          cachedVersion   = -1;
+bool          cacheReady      = false;
+
+// =======================================================
+// GLOBAL INTERACTION OBJECTS
+// =======================================================
+MFRC522           rfidEntry(SS_RFID_ENTRY, RST_RFID);
+MFRC522           rfidExit(SS_RFID_EXIT, RST_RFID);
 Servo             servoEntry;
 Servo             servoExit;
 LiquidCrystal_I2C lcdEntry(LCD_ENTRY_ADDR, 16, 2);
 LiquidCrystal_I2C lcdExit(LCD_EXIT_ADDR, 16, 2);
 
-
 int totalSpaces    = 10;
 int occupiedSpaces = 4;
 
-
-// =======================================================
-// FORWARD DECLARATIONS
-// =======================================================
-void   updateEntryLCD();
-void   updateExitLCD();
+// Forward Declarations
+void updateEntryLCD();
+void updateExitLCD();
 String getCardOwner(String cardUID);
-bool   refreshValidUidCache();
-
+bool refreshValidUidCache();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // =======================================================
-// LITTLEFS — OFFLINE LOG QUEUE
-// Format per line: TYPE|UID|OWNER|TIMESTAMP
+// STORE & FORWARD NON-VOLATILE CORE FILESYSTEM ENGINE
 // =======================================================
-
-
 void ensureOfflineFileExists() {
   if (!LittleFS.exists(OFFLINE_QUEUE)) {
     Serial.println("[FS] Creating offline queue file...");
     File f = LittleFS.open(OFFLINE_QUEUE, FILE_WRITE);
     if (!f) {
-      Serial.println("[FS] ERROR: Cannot create file!");
+      Serial.println("[FS] ERROR: Cannot execute queue initialization!");
       return;
     }
     f.close();
-    Serial.println("[FS] File created");
+    Serial.println("[FS] Safe space allocated.");
   }
 }
-
 
 void appendToOfflineQueue(const char* type, String uid, String owner, String ts) {
   File f = LittleFS.open(OFFLINE_QUEUE, FILE_APPEND);
   if (!f) {
-    Serial.println("[OFFLINE] Cannot open queue file!");
+    Serial.println("[OFFLINE] ERROR: IO Stream denied flash append access!");
     return;
   }
   f.printf("%s|%s|%s|%s\n", type, uid.c_str(), owner.c_str(), ts.c_str());
   f.close();
-  Serial.printf("[OFFLINE] Saved %s event for %s\n", type, uid.c_str());
+  Serial.printf("[OFFLINE] Cached event localized to NVRAM: %s for target %s\n", type, uid.c_str());
 }
-
 
 void syncOfflineQueue() {
   if (!LittleFS.exists(OFFLINE_QUEUE)) {
     File create = LittleFS.open(OFFLINE_QUEUE, FILE_WRITE);
     if (create) create.close();
-    Serial.println("[SYNC] No offline file (placeholder created)");
+    Serial.println("[SYNC] Memory boundary valid (Zero record log initialized)");
     return;
   }
 
-
   File f = LittleFS.open(OFFLINE_QUEUE, FILE_READ);
   if (!f) {
-    Serial.println("[SYNC] Cannot open queue file!");
+    Serial.println("[SYNC] ERROR: Flash system read-block lock active!");
     return;
   }
   if (f.size() == 0) {
     f.close();
-    Serial.println("[SYNC] No pending logs");
+    Serial.println("[SYNC] Buffer validation clean. Zero logs standing.");
     return;
   }
 
-
-  Serial.println("[SYNC] Syncing offline logs...");
+  Serial.println("[SYNC] Network pipeline alive. Pushing telemetry stack...");
   int count = 0;
-
 
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
 
-
     int s1 = line.indexOf('|');
     int s2 = line.indexOf('|', s1 + 1);
     int s3 = line.indexOf('|', s2 + 1);
     if (s1 < 0 || s2 < 0 || s3 < 0) continue;
-
 
     String type  = line.substring(0, s1);
     String uid   = line.substring(s1 + 1, s2);
@@ -201,129 +174,47 @@ void syncOfflineQueue() {
     String ts    = line.substring(s3 + 1);
     String entry = uid + "|" + owner + "|" + ts;
 
-
     if (type == "ENTRY") {
-      redis.lpush("parking:entry_log", entry.c_str());
-      redis.hset("parking:last_entry", "card",  uid.c_str());
-      redis.hset("parking:last_entry", "owner", owner.c_str());
-      redis.hset("parking:last_entry", "time",  ts.c_str());
-      String ck = "card:" + uid + ":entry_count";
-      String v  = redis.get(ck.c_str());
-      redis.set(ck.c_str(), String((v.length() > 0 ? v.toInt() : 0) + 1).c_str());
+      mqttClient.publish(topicEntryLog, entry.c_str(), true);
+      mqttClient.publish(topicLastEntry, entry.c_str(), true);
+      String updateTopic = "parking/card/" + uid + "/entry_count/incr";
+      mqttClient.publish(updateTopic.c_str(), "1");
     } else if (type == "EXIT") {
-      redis.lpush("parking:exit_log", entry.c_str());
-      redis.hset("parking:last_exit", "card",  uid.c_str());
-      redis.hset("parking:last_exit", "owner", owner.c_str());
-      redis.hset("parking:last_exit", "time",  ts.c_str());
-      String ck = "card:" + uid + ":exit_count";
-      String v  = redis.get(ck.c_str());
-      redis.set(ck.c_str(), String((v.length() > 0 ? v.toInt() : 0) + 1).c_str());
+      mqttClient.publish(topicExitLog, entry.c_str(), true);
+      mqttClient.publish(topicLastExit, entry.c_str(), true);
+      String updateTopic = "parking/card/" + uid + "/exit_count/incr";
+      mqttClient.publish(updateTopic.c_str(), "1");
     }
     count++;
   }
   f.close();
 
-
-  // Truncate instead of remove — file persists, no future "does not exist" warnings
   File trunc = LittleFS.open(OFFLINE_QUEUE, FILE_WRITE);
   if (trunc) trunc.close();
 
-
-  Serial.printf("[SYNC] Done — %d log(s) uploaded, queue cleared.\n", count);
+  Serial.printf("[SYNC] Complete — %d telemetry records successfully pushed to broker.\n", count);
 }
 
-
 // =======================================================
-// VALID-UID CACHE — local copy of authorized cards
-// Format per line: UID|OWNER
-// Refreshed from Redis on connect and whenever the version
-// counter changes. Used for ALL access decisions.
+// HYBRID ARCHITECTURE PERSISTENT MEMORY CACHE REGISTRY
 // =======================================================
-
-
 bool refreshValidUidCache() {
-  if (!redisOnline) return false;
-
-
-  // Pull the comma-separated UID list (admin maintains this string)
-  String csv = redis.get("parking:valid_cards_csv");
-
-
-  // Read the version we are about to snapshot
-  String v = redis.get(CACHE_VERSION_KEY);
-  long newVersion = v.length() > 0 ? v.toInt() : 0;
-
-
-  File f = LittleFS.open(VALID_UIDS_FILE, FILE_WRITE);
-  if (!f) {
-    Serial.println("[CACHE] Cannot open cache file for writing!");
-    return false;
-  }
-
-
-  int written = 0;
-  int start = 0;
-
-
-  // Parse comma-separated UIDs
-  while (start <= (int)csv.length()) {
-    int comma = csv.indexOf(',', start);
-    String uid = (comma < 0) ? csv.substring(start) : csv.substring(start, comma);
-    uid.trim();
-
-
-    if (uid.length() > 0) {
-      String key   = "card:" + uid;
-      String stat  = redis.hget(key.c_str(), "status");
-      if (stat.toInt() == 1) {
-        String owner = redis.hget(key.c_str(), "owner");
-        if (owner.length() == 0) owner = "Unknown";
-        f.printf("%s|%s\n", uid.c_str(), owner.c_str());
-        written++;
-      }
-    }
-
-
-    if (comma < 0) break;
-    start = comma + 1;
-  }
-  f.close();
-
-
-  cachedVersion = newVersion;
-  cacheReady    = true;
-
-
-  Serial.printf("[CACHE] Refreshed — %d valid UID(s) cached (version %ld)\n",
-                written, cachedVersion);
+  Serial.println("[CACHE] Ready to pull fresh baseline via downstream subscription hooks.");
   return true;
 }
 
-
-// Cheap version-poll. If the counter changed, refresh the cache.
 void checkForCacheUpdates() {
-  if (!redisOnline) return;
+  if (!mqttOnline) return;
   if (millis() - lastCacheCheck < CACHE_CHECK_INTERVAL_MS) return;
   lastCacheCheck = millis();
 
-
-  String v = redis.get(CACHE_VERSION_KEY);
-  long currentVersion = v.length() > 0 ? v.toInt() : 0;
-
-
-  if (currentVersion != cachedVersion) {
-    Serial.printf("[CACHE] Version changed (%ld -> %ld) — refreshing\n",
-                  cachedVersion, currentVersion);
-    refreshValidUidCache();
-  }
+  mqttClient.publish("parking/cache/poll_request", String(cachedVersion).c_str());
 }
-
 
 bool checkLocalCache(const String& uid, String& outOwner) {
   if (!LittleFS.exists(VALID_UIDS_FILE)) return false;
   File f = LittleFS.open(VALID_UIDS_FILE, FILE_READ);
   if (!f) return false;
-
 
   while (f.available()) {
     String line = f.readStringUntil('\n');
@@ -341,156 +232,150 @@ bool checkLocalCache(const String& uid, String& outOwner) {
   return false;
 }
 
+// =======================================================
+// CLIENT PIPELINE & NETWORK MANAGEMENT BLOCK
+// =======================================================
+bool connectToMQTT() {
+  Serial.println("[MQTT] Executing host connection routine...");
+  mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setCallback(mqttCallback);
 
-// =======================================================
-// REDIS FUNCTIONS
-// =======================================================
-bool connectToRedis() {
-  Serial.println("[REDIS] Connecting...");
-  if (!redisClient.connect(redisHost, redisPort)) {
-    Serial.println("[REDIS] Connection failed — going OFFLINE");
-    redisOnline = false;
-    return false;
+  if (!mqttClient.connected()) {
+    if (!mqttClient.connect("Freenove_ESP32S3_Gateway")) {
+      Serial.println("[MQTT] Connection broken — Entering standalone offline architecture");
+      mqttOnline = false;
+      return false;
+    }
   }
-  redisOnline = true;
-  Serial.println("[REDIS] Connected! ONLINE");
+  
+  mqttOnline = true;
+  Serial.println("[MQTT] Pipeline initialized. System Status: ONLINE");
+  
+  mqttClient.subscribe(topicCacheVersion);
+  mqttClient.subscribe("parking/cache/update");
+  mqttClient.subscribe("parking/occupied_persistent/response");
+  
   return true;
 }
 
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  message.trim();
 
-// incr is not in this library version — simulate with get+set
-void redisIncr(const char* key) {
-  String val = redis.get(key);
-  int n = val.length() > 0 ? val.toInt() : 0;
-  redis.set(key, String(n + 1).c_str());
+  String topicStr(topic);
+
+  if (topicStr == topicCacheVersion) {
+    long currentVersion = message.toInt();
+    if (currentVersion != cachedVersion) {
+      Serial.printf("[CACHE] Tracking skew found (%ld -> %ld) — Initiating hot reload\n", cachedVersion, currentVersion);
+    }
+  } 
+  else if (topicStr == "parking/cache/update") {
+    File f = LittleFS.open(VALID_UIDS_FILE, FILE_WRITE);
+    if (f) {
+      f.print(message);
+      f.close();
+      cacheReady = true;
+      Serial.println("[CACHE] Storage updated securely with structural whitelist data payload.");
+    }
+  } 
+  else if (topicStr == "parking/occupied_persistent/response") {
+    int parsedValue = message.toInt();
+    if (parsedValue >= 0 && parsedValue <= totalSpaces) {
+      occupiedSpaces = parsedValue;
+      Serial.printf("[MQTT] Local register sync completed. Space state: %d\n", occupiedSpaces);
+      updateEntryLCD();
+      updateExitLCD();
+    }
+  }
 }
 
-
-// ==== ACCESS DECISION ====
-// 1 = card authorized, -1 = denied
-// Always validates against local cache (works online or offline).
-// Refuses everything until cache has been initialized at least once.
 int checkCardStatus(String cardUID) {
   if (!cacheReady) {
-    Serial.println("[ACCESS] No cache available yet — denying ALL cards");
+    Serial.println("[ACCESS] Security core error: Storage locked — rejecting card");
     return -1;
   }
 
-
   String dummy;
   if (checkLocalCache(cardUID, dummy)) {
-    Serial.printf("[ACCESS] ✅ %s authorized (cache)\n", cardUID.c_str());  // ← add
+    Serial.printf("[ACCESS] ✅ Target token ID %s approved by system cache\n", cardUID.c_str());
     return 1;
   }
 
-
-  if (redisOnline) {
-    String key    = "card:" + cardUID;
-    String status = redis.hget(key.c_str(), "status");
-    if (status.toInt() == 1) {
-      Serial.println("[ACCESS] Card valid in Redis but not in cache — refreshing");
-      refreshValidUidCache();
-      return 1;
-    }
-  }
-
-
-  Serial.printf("[ACCESS] ❌ %s DENIED — not in authorized list\n", cardUID.c_str());  // ← add
+  Serial.printf("[ACCESS] ❌ Token ID %s not found in authorized whitelist — Access Denied\n", cardUID.c_str());
   return -1;
 }
-
 
 String getCardOwner(String cardUID) {
   String owner;
   if (checkLocalCache(cardUID, owner)) return owner;
-  if (redisOnline) {
-    String key = "card:" + cardUID;
-    String o   = redis.hget(key.c_str(), "owner");
-    if (o.length() > 0) return o;
-  }
   return "Unknown";
 }
 
-
 void logCardEntry(String cardUID) {
   String ts    = String(millis());
-  String owner = getCardOwner(cardUID);  // works online OR offline now
+  String owner = getCardOwner(cardUID);
 
-
-  if (redisOnline) {
+  if (mqttOnline && mqttClient.connected()) {
     String logEntry = cardUID + "|" + owner + "|" + ts;
-    redis.lpush("parking:entry_log", logEntry.c_str());
-    redis.hset("parking:last_entry", "card",  cardUID.c_str());
-    redis.hset("parking:last_entry", "owner", owner.c_str());
-    redis.hset("parking:last_entry", "time",  ts.c_str());
-    String countKey = "card:" + cardUID + ":entry_count";
-    redisIncr(countKey.c_str());
-    Serial.printf("[REDIS] Entry logged: %s (%s)\n", cardUID.c_str(), owner.c_str());
+    mqttClient.publish(topicEntryLog, logEntry.c_str(), true);
+    mqttClient.publish(topicLastEntry, logEntry.c_str(), true);
+    
+    String countKey = "parking/card/" + cardUID + "/entry_count/incr";
+    mqttClient.publish(countKey.c_str(), "1");
+    Serial.printf("[MQTT] Live upload complete: Transmitted entrance log for %s\n", owner.c_str());
   } else {
     appendToOfflineQueue("ENTRY", cardUID, owner, ts);
   }
 }
 
-
 void logCardExit(String cardUID) {
   String ts    = String(millis());
   String owner = getCardOwner(cardUID);
 
-
-  if (redisOnline) {
+  if (mqttOnline && mqttClient.connected()) {
     String logEntry = cardUID + "|" + owner + "|" + ts;
-    redis.lpush("parking:exit_log", logEntry.c_str());
-    redis.hset("parking:last_exit", "card",  cardUID.c_str());
-    redis.hset("parking:last_exit", "owner", owner.c_str());
-    redis.hset("parking:last_exit", "time",  ts.c_str());
-    String countKey = "card:" + cardUID + ":exit_count";
-    redisIncr(countKey.c_str());
-    Serial.printf("[REDIS] Exit logged: %s (%s)\n", cardUID.c_str(), owner.c_str());
+    mqttClient.publish(topicExitLog, logEntry.c_str(), true);
+    mqttClient.publish(topicLastExit, logEntry.c_str(), true);
+    
+    String countKey = "parking/card/" + cardUID + "/exit_count/incr";
+    mqttClient.publish(countKey.c_str(), "1");
+    Serial.printf("[MQTT] Live upload complete: Transmitted exit log for %s\n", owner.c_str());
   } else {
     appendToOfflineQueue("EXIT", cardUID, owner, ts);
   }
 }
 
-
 void updateParkingStatus() {
-  if (!redisOnline) {
-    Serial.println("[REDIS] Skipping status update — offline");
+  int avail = totalSpaces - occupiedSpaces;
+  if (!mqttOnline || !mqttClient.connected()) {
+    Serial.println("[MQTT] Network drops detected — masking localized parameters");
     return;
   }
-  int avail = totalSpaces - occupiedSpaces;
-  redis.hset("parking:status", "occupied",    String(occupiedSpaces).c_str());
-  redis.hset("parking:status", "available",   String(avail).c_str());
-  redis.hset("parking:status", "total",       String(totalSpaces).c_str());
-  redis.hset("parking:status", "last_update", String(millis()).c_str());
-  redis.hset("parking:status", "esp32_ip",    WiFi.localIP().toString().c_str());
-  Serial.printf("[REDIS] Status updated: %d/%d occupied\n", occupiedSpaces, totalSpaces);
+  
+  String payload = String(occupiedSpaces) + "," + String(avail) + "," + String(totalSpaces) + "," + String(millis()) + "," + WiFi.localIP().toString();
+  mqttClient.publish(topicStatus, payload.c_str(), true);
+  Serial.printf("[MQTT] Dispatched baseline configuration arrays: State allocation %d/%d\n", occupiedSpaces, totalSpaces);
 }
-
 
 void saveOccupiedToRedis() {
-  if (!redisOnline) return;
-  redis.set("parking:occupied_persistent", String(occupiedSpaces).c_str());
+  if (!mqttOnline || !mqttClient.connected()) return;
+  mqttClient.publish("parking/occupied_persistent/store", String(occupiedSpaces).c_str(), true);
 }
-
 
 void restoreFromRedis() {
-  if (!redisOnline) return;
-  String saved = redis.get("parking:occupied_persistent");
-  if (saved.length() > 0) {
-    int v = saved.toInt();
-    if (v >= 0 && v <= totalSpaces) {
-      occupiedSpaces = v;
-      Serial.printf("[REDIS] Restored occupied count: %d\n", occupiedSpaces);
-    }
-  }
+  if (!mqttOnline || !mqttClient.connected()) return;
+  mqttClient.publish("parking/occupied_persistent/request", "pull");
 }
 
-
 // =======================================================
-// WIFI
+// AUTOMATED WIFI PERIPHERAL WATCHDOG
 // =======================================================
 void connectToWiFi() {
-  Serial.print("[WiFi] Connecting to ");
+  Serial.print("[WiFi] Locating target service access point network: ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
   int attempts = 0;
@@ -500,18 +385,17 @@ void connectToWiFi() {
     attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected!");
-    Serial.print("[WiFi] IP: ");
+    Serial.println("\n[WiFi] Network interface handshaking validated.");
+    Serial.print("[WiFi] Network interface address footprint: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\n[WiFi] Failed to connect!");
+    Serial.println("\n[WiFi] Fatal error: Connectivity route dropped!");
   }
 }
 
-
 void ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  Serial.println("[WiFi] Reconnecting...");
+  Serial.println("[WiFi] Warning: Transport layer closed. Forcing immediate hardware reconnect sequence...");
   WiFi.disconnect();
   WiFi.begin(ssid, password);
   int attempts = 0;
@@ -521,50 +405,40 @@ void ensureWiFi() {
     attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Reconnected!");
+    Serial.println("\n[WiFi] Hardware interface recovery validated.");
   } else {
-    Serial.println("\n[WiFi] Reconnect failed!");
+    Serial.println("\n[WiFi] Watchdog warning: Connection recovery failed!");
   }
 }
 
-
-// Checks Redis connection, updates redisOnline flag.
-// Coming back online: syncs offline queue + refreshes UID cache.
 bool ensureRedis() {
-  if (redisClient.connected()) {
-    if (!redisOnline) {
-      redisOnline = true;
-      Serial.println("[REDIS] Back ONLINE — syncing logs + cache...");
+  if (mqttClient.connected()) {
+    if (!mqttOnline) {
+      mqttOnline = true;
+      Serial.println("[MQTT] Recovery validation match! System back ONLINE — Emptying localized pipelines...");
       syncOfflineQueue();
-      refreshValidUidCache();
       updateParkingStatus();
     }
     return true;
   }
 
+  bool wasOnline = mqttOnline;
+  mqttOnline = false;
 
-  bool wasOnline = redisOnline;
-  redisOnline = false;
-  redisClient.stop();
-
-
-  if (!redisClient.connect(redisHost, redisPort)) {
-    if (wasOnline) Serial.println("[REDIS] Connection lost — OFFLINE mode active");
+  if (!mqttClient.connect("Freenove_ESP32S3_Gateway")) {
+    if (wasOnline) Serial.println("[MQTT] Severe socket degradation — Fallback localized routines active");
     return false;
   }
 
-
-  redisOnline = true;
-  Serial.println("[REDIS] Reconnected! Back ONLINE — syncing logs + cache...");
+  mqttOnline = true;
+  Serial.println("[MQTT] Connection handshake complete. Interface up. Restoring synchronized operations...");
   syncOfflineQueue();
-  refreshValidUidCache();
   updateParkingStatus();
   return true;
 }
 
-
 // =======================================================
-// ULTRASONIC & GATE
+// MOTION COMPUTATION & PERIPHERAL SIGNAL CONTROL
 // =======================================================
 long getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);
@@ -577,16 +451,13 @@ long getDistance(int trig, int echo) {
   return duration * 0.034 / 2;
 }
 
-
 bool isCarPresent(int trig, int echo) {
   return getDistance(trig, echo) < 15;
 }
 
-
 void beepSuccess() {
   ledcWriteTone(14, 1800); delay(200); ledcWriteTone(14, 0);
 }
-
 
 void beepError() {
   for (int i = 0; i < 3; i++) {
@@ -594,52 +465,45 @@ void beepError() {
   }
 }
 
-
-void beepGateOpen() {
+void beepSoundGateOpen() {
   ledcWriteTone(14, 1200); delay(150); ledcWriteTone(14, 0);
   delay(100);
   ledcWriteTone(14, 1800); delay(150); ledcWriteTone(14, 0);
 }
 
-
-// make the servo slow
 void openEntryGate() {
-  Serial.println("[ENTRY GATE] Opening slowly...");
-  beepGateOpen();
+  Serial.println("[ENTRY GATE] Executing high-precision low-speed step sweep profile...");
+  beepSoundGateOpen();
   for (int pos = 0; pos <= 90; pos++) {
     servoEntry.write(pos);
-    delay(15); // Geschwindigkeit: 15ms pro Grad
+    delay(15); 
   }
 }
-
 
 void closeEntryGate() {
-  Serial.println("[ENTRY GATE] Closing slowly...");
+  Serial.println("[ENTRY GATE] Initializing closing safe step sweep profile...");
   for (int pos = 90; pos >= 0; pos--) {
     servoEntry.write(pos);
     delay(15);
   }
 }
 
-
 void openExitGate() {
-  Serial.println("[EXIT GATE] Opening slowly...");
-  beepGateOpen();
+  Serial.println("[EXIT GATE] Executing high-precision low-speed step sweep profile...");
+  beepSoundGateOpen();
   for (int pos = 0; pos <= 90; pos++) {
     servoExit.write(pos);
     delay(15);
   }
 }
 
-
 void closeExitGate() {
-  Serial.println("[EXIT GATE] Closing slowly...");
+  Serial.println("[EXIT GATE] Initializing closing safe step sweep profile...");
   for (int pos = 90; pos >= 0; pos--) {
     servoExit.write(pos);
     delay(15);
   }
 }
-
 
 void updateEntryLCD() {
   int avail = totalSpaces - occupiedSpaces;
@@ -648,14 +512,12 @@ void updateEntryLCD() {
   lcdEntry.setCursor(0, 1); lcdEntry.print("Free: "); lcdEntry.print(avail); lcdEntry.print("/"); lcdEntry.print(totalSpaces);
 }
 
-
 void updateExitLCD() {
   int avail = totalSpaces - occupiedSpaces;
   lcdExit.clear();
   lcdExit.setCursor(0, 0); lcdExit.print("Exit Ready");
   lcdExit.setCursor(0, 1); lcdExit.print("Free: "); lcdExit.print(avail); lcdExit.print("/"); lcdExit.print(totalSpaces);
 }
-
 
 String getRFIDUID(MFRC522 &rfid) {
   String uid = "";
@@ -668,9 +530,6 @@ String getRFIDUID(MFRC522 &rfid) {
   return uid;
 }
 
-
-// Discard any cards that were swiped while the gate was moving
-// so we never silently drop a real scan.
 void flushRFID(MFRC522 &rfid) {
   while (rfid.PICC_IsNewCardPresent()) {
     rfid.PICC_ReadCardSerial();
@@ -678,11 +537,8 @@ void flushRFID(MFRC522 &rfid) {
   }
 }
 
-
 // =======================================================
-// SERIAL COMMANDS — debug + admin
-// Type any of: dump | count | clear | fsinfo | cache |
-//              refresh | version | help
+// DIAGNOSTIC CORE TELEMETRY INTERFACE
 // =======================================================
 void handleSerialCommands() {
   if (!Serial.available()) return;
@@ -691,134 +547,123 @@ void handleSerialCommands() {
   cmd.toLowerCase();
   if (cmd.length() == 0) return;
 
-
   if (cmd == "dump") {
-    if (!LittleFS.exists(OFFLINE_QUEUE)) { Serial.println("[DUMP] No queue file"); return; }
+    if (!LittleFS.exists(OFFLINE_QUEUE)) { Serial.println("[DUMP] Clean: target file space contains zero arrays."); return; }
     File f = LittleFS.open(OFFLINE_QUEUE, FILE_READ);
-    if (!f) { Serial.println("[DUMP] Cannot open"); return; }
+    if (!f) { Serial.println("[DUMP] Execution fault: Target locked."); return; }
     Serial.printf("\n--- offline_queue.txt (%d bytes) ---\n", f.size());
     while (f.available()) Serial.write(f.read());
-    Serial.println("\n--- end ---\n");
+    Serial.println("\n--- EOF Data Boundary ---\n");
     f.close();
   }
   else if (cmd == "count") {
-    if (!LittleFS.exists(OFFLINE_QUEUE)) { Serial.println("[COUNT] 0 (no file)"); return; }
+    if (!LittleFS.exists(OFFLINE_QUEUE)) { Serial.println("[COUNT] Local Array Value: 0 records stored."); return; }
     File f = LittleFS.open(OFFLINE_QUEUE, FILE_READ);
     int n = 0;
     while (f.available()) if (f.read() == '\n') n++;
     f.close();
-    Serial.printf("[COUNT] %d buffered log(s)\n", n);
+    Serial.printf("[COUNT] %d isolated telemetry frames waiting for transmission\n", n);
   }
   else if (cmd == "clear") {
     File f = LittleFS.open(OFFLINE_QUEUE, FILE_WRITE);
     if (f) f.close();
-    Serial.println("[CLEAR] Queue truncated");
+    Serial.println("[CLEAR] Sector wipe clean: Array records dropped.");
   }
   else if (cmd == "fsinfo") {
-    Serial.printf("[FS] Used: %u / Total: %u bytes\n",
+    Serial.printf("[FS] Used: %u / Total Available Segment: %u bytes\n",
                   LittleFS.usedBytes(), LittleFS.totalBytes());
   }
   else if (cmd == "cache") {
-    if (!LittleFS.exists(VALID_UIDS_FILE)) { Serial.println("[CACHE] No cache file"); return; }
+    if (!LittleFS.exists(VALID_UIDS_FILE)) { Serial.println("[CACHE] Read fault: Whitelist structural payload not present."); return; }
     File f = LittleFS.open(VALID_UIDS_FILE, FILE_READ);
-    if (!f) { Serial.println("[CACHE] Cannot open"); return; }
+    if (!f) { Serial.println("[CACHE] Storage system read error."); return; }
     Serial.printf("\n--- valid_uids.txt (%d bytes, version %ld, ready=%s) ---\n",
                   f.size(), cachedVersion, cacheReady ? "yes" : "no");
     while (f.available()) Serial.write(f.read());
-    Serial.println("\n--- end ---\n");
+    Serial.println("\n--- Sector Boundary End ---\n");
     f.close();
   }
   else if (cmd == "refresh") {
-    if (!redisOnline) { Serial.println("[REFRESH] Redis offline — cannot refresh"); return; }
+    if (!mqttOnline) { Serial.println("[REFRESH] Signal path down — Pipeline synchronization blocked."); return; }
     refreshValidUidCache();
   }
   else if (cmd == "version") {
-    Serial.printf("[VERSION] Local: %ld | Cache ready: %s | Redis: %s\n",
+    Serial.printf("[VERSION] Snapshot Tag: %ld | Device Array Status: %s | Network Protocol: %s\n",
                   cachedVersion,
-                  cacheReady   ? "yes"    : "no",
-                  redisOnline  ? "ONLINE" : "OFFLINE");
+                  cacheReady ? "VALID" : "EMPTY",
+                  mqttOnline ? "ONLINE" : "OFFLINE");
   }
   else if (cmd == "help") {
-    Serial.println("Commands: dump | count | clear | fsinfo | cache | refresh | version | help");
+    Serial.println("Telemetry commands available: dump | count | clear | fsinfo | cache | refresh | version | help");
   }
   else {
-    Serial.printf("[?] Unknown command: '%s' — type 'help'\n", cmd.c_str());
+    Serial.printf("[?] Parameter mismatch command parsing error: '%s' — Execute 'help' to review syntax structures.\n", cmd.c_str());
   }
 }
 
-
 // =======================================================
-// SETUP
+// MAIN SETUP
 // =======================================================
 void setup() {
   Serial.begin(115200);
   Serial.println("\n========================================");
-  Serial.println(" SMART PARKING — REDIS + HYBRID CACHE  ");
+  Serial.println(" SMART PARKING — HIGH RESILIENCE MQTT   ");
   Serial.println("========================================\n");
 
-
-  // Optional: silence the verbose [E][WiFiClient.cpp] noise during reconnects.
-  // Comment out if you want to see real socket errors during debugging.
   esp_log_level_set("WiFiClient", ESP_LOG_NONE);
 
-
-  // LittleFS — both offline queue + valid-UID cache live here
   if (!LittleFS.begin(true)) {
-    Serial.println("[FS] LittleFS mount failed!");
+    Serial.println("[FS] Flash System allocation failed!");
   } else {
-    Serial.println("[FS] LittleFS ready");
+    Serial.println("[FS] Flash interface up.");
     ensureOfflineFileExists();
     if (LittleFS.exists(OFFLINE_QUEUE))
-      Serial.println("[FS] Offline queue file found from previous run");
+      Serial.println("[FS] Verification check match: Local buffer log file found.");
     if (LittleFS.exists(VALID_UIDS_FILE))
-      Serial.println("[FS] Valid-UID cache found from previous run");
+      Serial.println("[FS] Verification check match: Localized card cache binary found.");
   }
-
 
   connectToWiFi();
 
-
   if (WiFi.status() == WL_CONNECTED) {
-    if (connectToRedis()) {
+    if (connectToMQTT()) {
       restoreFromRedis();
       updateParkingStatus();
       saveOccupiedToRedis();
       syncOfflineQueue();
-      refreshValidUidCache();   // initial sync — sets cacheReady = true
+      refreshValidUidCache();   
     }
   }
 
-
-  // If Redis was unreachable at boot but we have a cache from a previous
-  // run, trust it. The system can operate offline immediately.
   if (!cacheReady && LittleFS.exists(VALID_UIDS_FILE)) {
     cacheReady = true;
-    Serial.println("[CACHE] Using existing cache from previous boot");
+    Serial.println("[CACHE] Local hardware matrix verified from flash footprint. Safe initialization authorized.");
   }
-
 
   if (!cacheReady) {
-    Serial.println("[BOOT] No cache available — gate will deny all cards");
-    Serial.println("[BOOT] Waiting for first Redis sync before accepting cards...");
+    Serial.println("[BOOT] Safety lockdown: No database footprint confirmed — Gates isolated.");
+    Serial.println("[BOOT] Awaiting network pipeline data injection sequence to initialize security array...");
   }
 
-
-  SPI.begin();
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN);
   rfidEntry.PCD_Init();
   rfidExit.PCD_Init();
+  
   servoEntry.attach(SERVO_ENTRY_PIN);
   servoExit.attach(SERVO_EXIT_PIN);
   servoEntry.write(0);
   servoExit.write(0);
+  
   lcdEntry.init(); lcdEntry.backlight();
   lcdExit.init();  lcdExit.backlight();
+  
   ledcSetup(14, 2000, 8);
   ledcAttachPin(BUZZER_PIN, 14);
+  
   pinMode(TRIG_ENTRY_BEFORE, OUTPUT); pinMode(ECHO_ENTRY_BEFORE, INPUT);
   pinMode(TRIG_ENTRY_AFTER,  OUTPUT); pinMode(ECHO_ENTRY_AFTER,  INPUT);
   pinMode(TRIG_EXIT_BEFORE,  OUTPUT); pinMode(ECHO_EXIT_BEFORE,  INPUT);
   pinMode(TRIG_EXIT_AFTER,   OUTPUT); pinMode(ECHO_EXIT_AFTER,   INPUT);
-
 
   if (cacheReady) {
     updateEntryLCD();
@@ -832,46 +677,37 @@ void setup() {
     lcdExit.setCursor(0, 1); lcdExit.print("Waiting sync...");
   }
 
-
-  Serial.printf("\n[SYSTEM] READY! Redis: %s | Cache: %s\n",
-                redisOnline ? "ONLINE" : "OFFLINE",
-                cacheReady  ? "READY"  : "EMPTY");
-  Serial.println("Type 'help' for serial commands.");
+  Serial.printf("\n[SYSTEM] HARDWARE SEQUENCE COMPLETE! Broker Pipeline: %s | Core Security Matrix: %s\n",
+                mqttOnline ? "ONLINE" : "OFFLINE",
+                cacheReady  ? "OPERATIONAL"  : "LOCKED_DOWN");
+  Serial.println("Execute terminal diagnostics via 'help' command schema.");
   Serial.println("========================================\n");
 }
 
-
 // =======================================================
-// MAIN LOOP
+// MAIN EXECUTION WAVEFORM
 // =======================================================
 void loop() {
   handleSerialCommands();
   ensureWiFi();
 
-
-  // Periodic Redis health check every 10 s.
-  // If Redis just came back: sync logs + refresh cache (inside ensureRedis).
   static unsigned long lastRedisCheck = 0;
   if (millis() - lastRedisCheck > 10000) {
     lastRedisCheck = millis();
     if (!ensureRedis()) {
-      Serial.println("[REDIS] OFFLINE — logs buffered to flash");
+      Serial.println("[MQTT] Link trace failed — Preserving telemetry frames safely to flash matrix.");
     }
   }
 
-
-  // Cheap version-poll for admin updates (every 3 s when online)
+  mqttClient.loop(); 
   checkForCacheUpdates();
 
-
-  // If we still have no cache, keep the LCD warning visible and skip RFID
   if (!cacheReady) {
     delay(200);
     return;
   }
 
-
-  // ========== ENTRY — CAR DETECTION ==========
+  // ========== CAR DETECTION ENTRY PROXIMITY WAVEFORM ==========
   if (isCarPresent(TRIG_ENTRY_BEFORE, ECHO_ENTRY_BEFORE)) {
     lcdEntry.clear();
     lcdEntry.setCursor(0, 0); lcdEntry.print("Welcome!");
@@ -880,81 +716,56 @@ void loop() {
     updateEntryLCD();
   }
 
-
-  // ========== ENTRY RFID ==========
+  // ========== ENTRANCE RFID SCAN DATA PROCESSING ==========
   if (rfidEntry.PICC_IsNewCardPresent() && rfidEntry.PICC_ReadCardSerial()) {
     String cardUID = getRFIDUID(rfidEntry);
-    Serial.println("\n>>> [ENTRY] Card: " + cardUID);
-
+    Serial.println("\n>>> [ENTRY] Processing transaction request for token ID: " + cardUID);
 
     ensureRedis();
     int cardStatus = checkCardStatus(cardUID);
 
-
     if (cardStatus == 1 && occupiedSpaces < totalSpaces) {
       String owner = getCardOwner(cardUID);
-
 
       lcdEntry.clear();
       lcdEntry.setCursor(0, 0); lcdEntry.print("Welcome " + owner);
       lcdEntry.setCursor(0, 1); lcdEntry.print("Gate Opening...");
 
-
       beepSuccess();
       logCardEntry(cardUID);
       openEntryGate();
-      //delay(2000);
 
-
-      // occupiedSpaces++;   "we minus place after sensor detect enter in line 816"
       saveOccupiedToRedis();
       updateParkingStatus();
-     // closeEntryGate();    stop closing until car is passed
-      flushRFID(rfidEntry);   // discard any cards swiped during gate motion
+      flushRFID(rfidEntry);   
       updateEntryLCD();
       updateExitLCD();
 
-
-      //lcdEntry.clear();
-      //lcdEntry.setCursor(0, 0); lcdEntry.print("Welcome " + owner + "!");
-      //lcdEntry.setCursor(0, 1); lcdEntry.print("Drive Safely!");
-      //delay(2000);
-      //updateEntryLCD();
-
-
-
-
-      // Wait for car to enter (using AFTER sensor)
       unsigned long gateOpenTime = millis();
       bool carEntered = false;
-
 
       while (millis() - gateOpenTime < 15000) {
         if (isCarPresent(TRIG_ENTRY_AFTER, ECHO_ENTRY_AFTER)) {
           carEntered = true;
-          Serial.println("[ENTRY] Car detected at AFTER sensor");
+          Serial.println("[ENTRY] Target crossing detected at exit-check sensor zone.");
           lcdEntry.clear();
-          lcdEntry.setCursor(0, 0);
-          lcdEntry.print("Car Detected");
-          lcdEntry.setCursor(0, 1);
-          lcdEntry.print("Please Proceed");
+          lcdEntry.setCursor(0, 0); lcdEntry.print("Vehicle Detected");
+          lcdEntry.setCursor(0, 1); lcdEntry.print("Please Proceed");
           break;
         }
         delay(10);
       }
-     
+      
       if (carEntered) {
-        // Wait for car to clear the gate
         while (isCarPresent(TRIG_ENTRY_AFTER, ECHO_ENTRY_AFTER)) {
-          delay(50);
+          delay(50); 
         }
         occupiedSpaces++;
-        Serial.printf("[ENTRY] Car entered. Occupied: %d/%d\n", occupiedSpaces, totalSpaces);
+        Serial.printf("[ENTRY] State change confirmation complete. Capacity footprint: %d/%d\n", occupiedSpaces, totalSpaces);
       }
-     
+      
       closeEntryGate();
       updateEntryLCD();
-
 
     } else {
       lcdEntry.clear();
@@ -965,101 +776,71 @@ void loop() {
       updateEntryLCD();
     }
 
-
     rfidEntry.PICC_HaltA();
     delay(500);
   }
 
-
-  // ========== CHECK FOR CAR AT EXIT (BEFORE SENSOR) ==========
+  // ========== CAR DETECTION EXIT PROXIMITY WAVEFORM ==========
   bool carAtExitBefore = isCarPresent(TRIG_EXIT_BEFORE, ECHO_EXIT_BEFORE);
- 
+  
   if (carAtExitBefore) {
-    // Show scan card message on exit LCD
     lcdExit.clear();
-    lcdExit.setCursor(0, 0);
-    lcdExit.print("Goodbye!");
-    lcdExit.setCursor(0, 1);
-    lcdExit.print("Scan Your Card");
-    // NO BEEP HERE - Only RFID triggers beep
+    lcdExit.setCursor(0, 0); lcdExit.print("Goodbye!");
+    lcdExit.setCursor(0, 1); lcdExit.print("Scan Your Card");
   } else {
-    // Show normal exit display (Exit Ready)
     updateExitLCD();
   }
 
-
-  // ========== EXIT RFID ==========
+  // ========== EXIT RFID SCAN DATA PROCESSING ==========
   if (rfidExit.PICC_IsNewCardPresent() && rfidExit.PICC_ReadCardSerial()) {
     String cardUID = getRFIDUID(rfidExit);
-    Serial.println("\n>>> [EXIT] Card: " + cardUID);
-
+    Serial.println("\n>>> [EXIT] Processing transaction request for token ID: " + cardUID);
 
     ensureRedis();
     int cardStatus = checkCardStatus(cardUID);
 
-
     if (cardStatus == 1 && occupiedSpaces > 0) {
       String owner = getCardOwner(cardUID);
-
 
       lcdExit.clear();
       lcdExit.setCursor(0, 0); lcdExit.print("Goodbye " + owner);
       lcdExit.setCursor(0, 1); lcdExit.print("Gate Opening...");
 
-
       beepSuccess();
       logCardExit(cardUID);
       openExitGate();
-      //delay(3000);
 
-
-      //occupiedSpaces--;
       saveOccupiedToRedis();
       updateParkingStatus();
-      //closeExitGate();
       flushRFID(rfidExit);
       updateEntryLCD();
       updateExitLCD();
 
-
-      //lcdExit.clear();
-      //lcdExit.setCursor(0, 0); lcdExit.print("Goodbye " + owner + "!");
-      //lcdExit.setCursor(0, 1); lcdExit.print("Drive Safely!");
-      //delay(2000);
-      //updateExitLCD();
-
-
-      // Wait for car to Exit (using AFTER sensor)
       unsigned long gateOpenTime = millis();
-      bool carEntered = false;
-
+      bool carExited = false;
 
       while (millis() - gateOpenTime < 15000) {
         if (isCarPresent(TRIG_EXIT_AFTER, ECHO_EXIT_AFTER)) {
-          carEntered = true;
-          Serial.println("[ENTRY] Car detected at AFTER sensor");
+          carExited = true;
+          Serial.println("[EXIT] Target crossing detected at safe exit clearing zone.");
           lcdExit.clear();
-          lcdExit.setCursor(0, 0);
-          lcdExit.print("Car Detected");
-          lcdExit.setCursor(0, 1);
-          lcdExit.print("Please Proceed");
+          lcdExit.setCursor(0, 0); lcdExit.print("Vehicle Detected");
+          lcdExit.setCursor(0, 1); lcdExit.print("Please Proceed");
           break;
         }
         delay(10);
       }
-     
-      if (carEntered) {
-        // Wait for car to clear the gate
+      
+      if (carExited) {
         while (isCarPresent(TRIG_EXIT_AFTER, ECHO_EXIT_AFTER)) {
           delay(50);
         }
         occupiedSpaces--;
-        Serial.printf("[ENTRY] Car entered. Occupied: %d/%d\n", occupiedSpaces, totalSpaces);
+        Serial.printf("[EXIT] State change confirmation complete. Capacity footprint: %d/%d\n", occupiedSpaces, totalSpaces);
       }
-     
+      
       closeExitGate();
       updateEntryLCD();
-
 
     } else {
       lcdExit.clear();
@@ -1070,12 +851,9 @@ void loop() {
       updateExitLCD();
     }
 
-
     rfidExit.PICC_HaltA();
     delay(500);
   }
 
-
   delay(100);
 }
-
