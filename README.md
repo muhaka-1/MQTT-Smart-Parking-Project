@@ -52,6 +52,15 @@ Ensure stable operation during network outages
 Improve parking flow and reduce traffic congestion
 
 # 🏗 System Architecture
+
+
+
+
+##  Circuit Diagram
+<p align="center">
+  <img width="750" alt="Circuit Diagram" src="./Circukt diagram.png" />
+</p>
+
 The system follows an Event-Driven IoT Architecture:
 
 Edge Device (ESP32): Monitors ultrasonic sensors and RFID readers.
@@ -69,6 +78,11 @@ Power Management: Uses common ground and specific voltage rails (3.3V for RFID, 
 Resilience: If the MQTT broker fails, logic continues using local state, and logs are queued in LittleFS.
 
 ### 🛠 Hardware Components
+
+## 🛠️ Component List & Hardware Roles
+<p align="center">
+  <img width="750" alt="Component List" src="./Component list.png" />
+</p>
 
 
 | Component                        | Purpose                                           |
@@ -105,6 +119,12 @@ Libraries: MFRC522, ESP32Servo, LiquidCrystal_I2C, PubSubClient
 * Deployment: Docker (MQTT-container)
 
 # 🔌 Technical Design Choices
+
+##  System Architecture
+<p align="center">
+  <img width="750" alt="System Architecture" src="./SystemArchitechture.png" />
+</p>
+
 MQTT vs Redis
 Moving to MQTT allows the system to be asynchronous. The ESP32 doesn't have to wait for a database "write" to complete; it simply "publishes" an event and moves to the next task, significantly improving responsiveness.
 
@@ -121,6 +141,11 @@ Safety Logic
 The barriers use a Timeout + Distance check. The gate only closes after 10 seconds IF the "After" sensor detects that the car has physically cleared the gate area, preventing damage to vehicles.
 
 ## In case of network failure:
+
+## 💾 Offline Data Buffering (LittleFS Logic)
+<p align="center">
+  <img width="750" alt="LittleFS Offline Logic" src="./LittleFS.png" />
+</p>
 
 Data is saved in /queue.txt via LittleFS
 
