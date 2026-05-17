@@ -1,8 +1,11 @@
 
 # 🚗 Automated IoT Smart Parking System with MQTT & Edge Resilience
 
-> A real-time parking management system designed using ESP32 (Edge Client), MQTT Broker (Central Communication), LCD Display with I2C, SPI, Wi-Fi (TCP/IP), RFID sensors, and Servo-controlled barriers..
+> A real-time parking management system designed using ESP32 (Edge Client), MQTT Broker (Central Communication), LCD Display with I2C, SPI, Wi-Fi (TCP/IP), RFID sensors, and Servo-controlled barriers.
+> 
 Watch project prototype vedio](https://drive.google.com/file/d/1zMqwTUaIUi8lEEkRGk4BoZeTIl_LKmPN/view)
+
+
 ![System Overview]()
 <img width="612" height="792" alt="System_Overview_Design_page_1" src="https://github.com/user-attachments/assets/af62bb73-367e-40c2-b27d-7cfa71aad8e8" />
 
