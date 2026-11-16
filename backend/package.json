@@ -1,0 +1,16 @@
+{
+  "name": "smart-parking-backend",
+  "version": "1.0.0",
+  "description": "Backend, database and admin dashboard for the MQTT Smart Parking System",
+  "main": "src/index.js",
+  "license": "MIT",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec test/e2e.test.js"
+  },
+  "dependencies": {
+    "aedes": "^0.51.3",
+    "mqtt": "^5.10.1"
+  }
+}

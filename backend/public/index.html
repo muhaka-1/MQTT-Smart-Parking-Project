@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Parking</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Sign in -->
+<main id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <div class="p-sign" aria-hidden="true">P</div>
+    <h1>Smart Parking</h1>
+    <p class="muted">Sign in to manage the gates, cards and activity log.</p>
+    <label for="login-password">Admin password</label>
+    <input id="login-password" type="password" autocomplete="current-password" required autofocus>
+    <p id="login-hint" class="hint" hidden>First run: the password is <b>admin</b>. Set <code>ADMIN_PASSWORD</code> to change it.</p>
+    <p id="login-error" class="error" role="alert" hidden></p>
+    <button class="btn primary" type="submit">Sign in</button>
+  </form>
+</main>
+
+<!-- Dashboard -->
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="p-sign small" aria-hidden="true">P</span><span>Smart Parking</span></div>
+    <div class="links">
+      <span class="link" id="link-device"><i class="dot"></i><span>Gate controller</span></span>
+      <span class="link" id="link-broker"><i class="dot"></i><span>MQTT broker</span></span>
+      <button class="btn quiet" id="logout" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="status" hidden></div>
+
+  <!-- The lot itself: entry gate, bays, exit gate -->
+  <section class="lot" aria-label="Parking lot right now">
+    <div class="gate" id="gate-entry">
+      <div class="gate-name">Entry</div>
+      <div class="barrier"><span class="post"></span><span class="arm"></span></div>
+      <div class="gate-state">closed</div>
+      <button class="btn on-dark" type="button" data-open="entry">Open entry gate</button>
+    </div>
+
+    <div class="lot-middle">
+      <div class="lot-count">
+        <span class="big" id="free-count">–</span>
+        <span class="count-label">free of <span id="total-count">–</span> spaces</span>
+      </div>
+      <div class="bays" id="bays" role="img" aria-label="Occupied spaces"></div>
+      <p class="lot-note" id="lot-note"></p>
+    </div>
+
+    <div class="gate" id="gate-exit">
+      <div class="gate-name">Exit</div>
+      <div class="barrier"><span class="post"></span><span class="arm"></span></div>
+      <div class="gate-state">closed</div>
+      <button class="btn on-dark" type="button" data-open="exit">Open exit gate</button>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="activity" aria-selected="true">Activity</button>
+    <button role="tab" data-tab="cards">Cards</button>
+    <button role="tab" data-tab="stats">Statistics</button>
+    <button role="tab" data-tab="bench" id="tab-bench">Test bench</button>
+    <button role="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <!-- Activity -->
+  <section class="panel" id="panel-activity">
+    <div class="toolbar">
+      <select id="ev-type" aria-label="Filter by type">
+        <option value="">All activity</option>
+        <option value="ENTRY">Entries</option>
+        <option value="EXIT">Exits</option>
+        <option value="DENIED">Denied</option>
+        <option value="ADMIN">Admin actions</option>
+      </select>
+      <input id="ev-search" type="search" placeholder="Search name or card UID" aria-label="Search activity">
+      <span class="spacer"></span>
+      <span class="muted" id="ev-count"></span>
+      <a class="btn" id="ev-export" href="/api/events.csv">Export CSV</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>What happened</th><th>Card holder</th><th>Card UID</th><th>Gate</th><th>Notes</th></tr></thead>
+        <tbody id="ev-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="ev-empty" hidden>No activity yet. Scan a card at a gate, or open the Test bench tab to simulate one.</p>
+    <button class="btn" id="ev-more" type="button" hidden>Show older activity</button>
+  </section>
+
+  <!-- Cards -->
+  <section class="panel" id="panel-cards" hidden>
+    <div class="toolbar">
+      <p class="muted">Active cards are sent to the gate controller and stored in its flash memory, so they keep working during a network outage.</p>
+      <span class="spacer"></span>
+      <button class="btn primary" id="card-add" type="button">Add card</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Card holder</th><th>Card UID</th><th>Licence plate</th><th>Status</th><th>Now</th><th>Visits</th><th>Last seen</th><th></th></tr></thead>
+        <tbody id="card-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="card-empty" hidden>No cards registered. Add one, or scan an unknown card at a gate and register it from the Activity tab.</p>
+  </section>
+
+  <!-- Statistics -->
+  <section class="panel" id="panel-stats" hidden>
+    <div class="toolbar">
+      <div class="segmented" id="stats-range" role="group" aria-label="Period">
+        <button type="button" data-range="today" aria-pressed="true">Today</button>
+        <button type="button" data-range="24h" aria-pressed="false">Last 24 hours</button>
+        <button type="button" data-range="7d" aria-pressed="false">Last 7 days</button>
+      </div>
+    </div>
+    <div class="tiles">
+      <div class="tile"><b id="st-entries">0</b><span>vehicles entered</span></div>
+      <div class="tile"><b id="st-exits">0</b><span>vehicles left</span></div>
+      <div class="tile"><b id="st-denied">0</b><span>scans denied</span></div>
+      <div class="tile"><b id="st-buffered">0</b><span>events delivered after an outage</span></div>
+    </div>
+    <div class="grid-2">
+      <figure class="chart">
+        <figcaption>Occupied spaces over time</figcaption>
+        <div id="chart-occupancy"></div>
+      </figure>
+      <figure class="chart">
+        <figcaption>Vehicles in and out <span class="legend"><i class="sw in"></i>in <i class="sw out"></i>out</span></figcaption>
+        <div id="chart-flow"></div>
+      </figure>
+    </div>
+    <div class="grid-3">
+      <div class="list-box"><h3>Inside right now</h3><ul id="st-inside"></ul></div>
+      <div class="list-box"><h3>Most frequent visitors</h3><ul id="st-top"></ul></div>
+      <div class="list-box"><h3>Why scans were denied</h3><ul id="st-reasons"></ul></div>
+    </div>
+  </section>
+
+  <!-- Test bench (simulator) -->
+  <section class="panel" id="panel-bench" hidden>
+    <div class="bench-head">
+      <div>
+        <h2>Virtual gate controller</h2>
+        <p class="muted">Behaves like the ESP32 firmware and talks to the backend over MQTT. Use it to test every feature without hardware. Switch it off before you connect the real ESP32.</p>
+      </div>
+      <div class="switches">
+        <label class="switch"><input type="checkbox" id="sim-power"><span>Power</span></label>
+        <label class="switch"><input type="checkbox" id="sim-network"><span>Network</span></label>
+      </div>
+    </div>
+
+    <div class="quick">
+      <label for="sim-card">Card</label>
+      <select id="sim-card"></select>
+      <input id="sim-uid" placeholder="or type any UID, e.g. FF:00:FF:00" aria-label="Custom card UID">
+      <button class="btn primary" type="button" data-drive="entry">Drive a car in</button>
+      <button class="btn primary" type="button" data-drive="exit">Drive a car out</button>
+      <span class="muted">plays the full sequence: arrive, scan, pass the barrier</span>
+    </div>
+
+    <div class="grid-2 bench-gates">
+      <div class="bench-gate" data-gate="entry">
+        <h3>Entry gate <span class="pill" data-role="gate">closed</span></h3>
+        <div class="lcd" data-role="lcd" aria-label="Entry display"><div></div><div></div></div>
+        <div class="steps">
+          <label class="check"><input type="checkbox" data-sensor="entryBefore"> Car waiting in front of the gate</label>
+          <button class="btn" type="button" data-scan="entry">Tap card on reader</button>
+          <label class="check"><input type="checkbox" data-sensor="entryAfter"> Car under / just past the barrier</label>
+        </div>
+      </div>
+      <div class="bench-gate" data-gate="exit">
+        <h3>Exit gate <span class="pill" data-role="gate">closed</span></h3>
+        <div class="lcd" data-role="lcd" aria-label="Exit display"><div></div><div></div></div>
+        <div class="steps">
+          <label class="check"><input type="checkbox" data-sensor="exitBefore"> Car waiting in front of the gate</label>
+          <button class="btn" type="button" data-scan="exit">Tap card on reader</button>
+          <label class="check"><input type="checkbox" data-sensor="exitAfter"> Car under / just past the barrier</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="list-box">
+        <h3>Flash memory <button class="btn quiet" id="sim-erase" type="button">Erase flash</button></h3>
+        <p id="sim-flash" class="muted"></p>
+        <h4>Events waiting for the backend</h4>
+        <ul id="sim-queue"></ul>
+      </div>
+      <div class="list-box">
+        <h3>Serial monitor <span class="pill" id="sim-buzzer" hidden></span></h3>
+        <pre id="sim-log" class="serial"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <section class="panel" id="panel-settings" hidden>
+    <div class="grid-2">
+      <form class="list-box" id="settings-form">
+        <h3>Parking lot</h3>
+        <label for="set-total">Total spaces</label>
+        <input id="set-total" type="number" min="1" max="500" required>
+        <label for="set-occupied">Occupied spaces right now</label>
+        <input id="set-occupied" type="number" min="0" max="500" required>
+        <p class="muted">The gate controller counts vehicles itself. Correct the number here if it has drifted, for example after someone tailgated.</p>
+        <button class="btn primary" type="submit">Save changes</button>
+      </form>
+      <div class="list-box">
+        <h3>Gate controller</h3>
+        <dl id="device-info" class="info"></dl>
+        <div class="row">
+          <button class="btn" id="push-whitelist" type="button">Send card list again</button>
+          <button class="btn danger" id="clear-events" type="button">Delete activity log</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- Add / edit card -->
+<dialog id="card-dialog">
+  <form id="card-form" method="dialog">
+    <h2 id="card-title">Add card</h2>
+    <label for="card-uid">Card UID</label>
+    <input id="card-uid" placeholder="A1:B2:C3:D4" required autocomplete="off">
+    <p class="muted">The hex number the reader prints for the card. Colons and spaces are optional.</p>
+    <label for="card-owner">Card holder</label>
+    <input id="card-owner" maxlength="40" required autocomplete="off">
+    <label for="card-plate">Licence plate (optional)</label>
+    <input id="card-plate" maxlength="16" autocomplete="off">
+    <p id="card-error" class="error" role="alert" hidden></p>
+    <div class="row end">
+      <button class="btn" type="button" id="card-cancel">Cancel</button>
+      <button class="btn primary" type="submit" id="card-save">Add card</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

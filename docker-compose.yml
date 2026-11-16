@@ -1,0 +1,32 @@
+# Smart Parking server side (Raspberry Pi or any computer with Docker).
+#   docker compose up -d --build
+#   Dashboard: http://<this-computer>:8080      MQTT for the ESP32: <this-computer>:1883
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    ports:
+      - "8080:8080"
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # Virtual ESP32 for testing without hardware. Set to "off" once the real one is installed.
+      SIMULATOR: ${SIMULATOR:-on}
+      TZ: ${TZ:-Europe/Stockholm}
+    volumes:
+      - parking-data:/data
+
+volumes:
+  mosquitto-data:
+  parking-data:
